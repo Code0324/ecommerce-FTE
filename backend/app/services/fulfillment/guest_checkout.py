@@ -890,6 +890,12 @@ def _is_error_page(url: str) -> bool:
 def _is_sign_in_url(url: str) -> bool:
     parsed = urlparse(url)
     path = parsed.path.lower()
+    query = parsed.query.lower()
+    # Check for Amazon's re-auth requirement (openid.pape.max_auth_age=900)
+    if "openid.pape.max_auth_age" in query:
+        logger.warning("DIAGNOSTIC: Amazon re-authentication required (openid.pape.max_auth_age detected)")
+        logger.warning(f"  Full URL: {url}")
+        return True
     return "signin" in path or "ap/signin" in path or "auth" in path
 
 def _page_has_sign_in_wall(page: Any) -> bool:
@@ -1298,6 +1304,20 @@ def _fill_guest_shipping_address(
     a cart page.
     """
     if not _is_checkout_page(page.url):
+        # DIAGNOSTIC: If we hit a max_auth_age URL, capture it
+        if "openid.pape.max_auth_age" in page.url:
+            logger.warning("DIAGNOSTIC: Capturing page state at max_auth_age signin URL")
+            logger.warning(f"  URL: {page.url}")
+            logger.warning(f"  Page title: {page.title()}")
+            try:
+                # Take a diagnostic screenshot
+                diag_dir = os.path.join(CHECKOUT_SCREENSHOT_DIR, "max_auth_age_diagnostic")
+                os.makedirs(diag_dir, exist_ok=True)
+                diag_path = os.path.join(diag_dir, f"max_auth_age_page_{int(time.time())}.png")
+                page.screenshot(path=diag_path, full_page=True)
+                logger.warning(f"  Screenshot: {diag_path}")
+            except Exception as e:
+                logger.warning(f"  Failed to capture diagnostic screenshot: {e}")
         raise GuestCheckoutError(
             f"refused to fill address on non-checkout page: {page.url}",
             recoverable=False,
@@ -1595,6 +1615,9 @@ def _capture_total_price(page: Any) -> str | None:
                 text = el.inner_text().strip()
                 price = _extract_price(text)
                 if price:
+                    # DIAGNOSTIC: Log the full element text vs extracted price
+                    if text != price:
+                        logger.debug(f"Price extraction: selector={sel}, full_text='{text}', extracted='{price}'")
                     return price
         except Exception:
             continue

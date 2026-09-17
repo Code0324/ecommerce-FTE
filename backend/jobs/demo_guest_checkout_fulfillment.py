@@ -114,63 +114,82 @@ def _parse_qty(v: str) -> int:
 
 
 def _fetch_eligible_orders(sheet_id: str) -> list[dict[str, Any]]:
-    """Return rows whose Status is Pending/Mapped AND have an ASIN/SKU in column M.
+    """Return rows where Price (O) and Delivery Date (P) are BOTH empty.
 
-    fetch_pending_orders does not include column M (Amazon ASIN/SKU) in its
-    returned dicts, so we read the raw rows ourselves to check that column.
+    Real schema (A-P):
+      A: Order ID, B: Date, C: SKU (Amazon ASIN), D: Product Name, E: Variation,
+      F: Qty, G: Recipient, H: Phone, I: Address 1, J: [blank], K: Delivery instructions,
+      L: City, M: State, N: Zipcode, O: Price, P: Delivery Date
+
+    Eligible orders = rows where both O (Price) and P (Delivery Date) are empty.
     """
     if not sheets_client.is_configured:
         logger.error("Google Sheets not configured -- GOOGLE_SHEETS_CREDENTIALS_PATH is unset or invalid")
         return []
 
-    logger.info(
-        "Fetching orders with status %s from sheet %s...",
-        "/".join(PICKUP_STATUSES_SHEET),
-        sheet_id,
-    )
+    logger.info("Fetching orders where Price and Delivery Date are empty from sheet %s...", sheet_id)
     all_rows = sheets_client.read_rows(sheet_id, "Sheet1!A1:P200")
     if not all_rows:
         logger.info("Sheet is empty")
         return []
 
-    # Find the header row.
-    header = all_rows[0]
-    header_lower = [h.lower().strip() for h in header] if header else []
-    status_idx = header_lower.index("status") if "status" in header_lower else 11
-    asin_idx = header_lower.index("amazon asin/sku") if "amazon asin/sku" in header_lower else 12
+    # Column indices (0-based)
+    COL_ORDER_ID = 0      # A
+    COL_DATE = 1          # B
+    COL_SKU = 2           # C (Amazon ASIN)
+    COL_PRODUCT_NAME = 3  # D
+    COL_VARIATION = 4     # E
+    COL_QTY = 5           # F
+    COL_RECIPIENT = 6     # G
+    COL_PHONE = 7         # H
+    COL_ADDRESS = 8       # I
+    # COL_BLANK = 9       # J (skip)
+    COL_DELIVERY_INSTR = 10  # K
+    COL_CITY = 11         # L
+    COL_STATE = 12        # M
+    COL_ZIPCODE = 13      # N
+    COL_PRICE = 14        # O
+    COL_DELIVERY_DATE = 15  # P
 
-    wanted = {s.strip().lower() for s in PICKUP_STATUSES_SHEET}
     eligible = []
     for idx, row in enumerate(all_rows[1:], start=2):  # 1-indexed, skip header
         if not row or not row[0].strip():
             continue
-        status = _safe_cell(row, status_idx)
-        if status.lower() not in wanted:
+
+        # Check eligibility: Price (O) and Delivery Date (P) must BOTH be empty
+        price = _safe_cell(row, COL_PRICE)
+        delivery_date = _safe_cell(row, COL_DELIVERY_DATE)
+
+        if price.strip() or delivery_date.strip():
+            # Already has price or delivery date - skip it
             continue
-        asin_sku = _safe_cell(row, asin_idx)
-        if not asin_sku:
-            logger.info(
-                "Skipping row %d (order %s): no ASIN/SKU in column M",
-                idx,
-                _safe_cell(row, 0),
-            )
+
+        # Has both Price and Delivery Date empty - eligible for processing
+        asin = _safe_cell(row, COL_SKU)
+        if not asin:
+            logger.info("Skipping row %d (order %s): no ASIN in column C", idx, _safe_cell(row, COL_ORDER_ID))
             continue
+
         eligible.append({
             "row_number": idx,
-            "order_id": _safe_cell(row, 0),
-            "buyer_name": _safe_cell(row, 1),
-            "shipping_address": _safe_cell(row, 2),
-            "city": _safe_cell(row, 3),
-            "state": _safe_cell(row, 4),
-            "zip": _safe_cell(row, 5),
-            "country": _safe_cell(row, 6),
-            "phone": _safe_cell(row, 7),
-            "qty": _safe_cell(row, 9, "1"),
-            "status": status,
-            "asin_sku": asin_sku,
+            "order_id": _safe_cell(row, COL_ORDER_ID),
+            "date": _safe_cell(row, COL_DATE),
+            "asin": asin,
+            "product_name": _safe_cell(row, COL_PRODUCT_NAME),
+            "variation": _safe_cell(row, COL_VARIATION),
+            "qty": _safe_cell(row, COL_QTY, "1"),
+            "buyer_name": _safe_cell(row, COL_RECIPIENT),
+            "phone": _safe_cell(row, COL_PHONE),
+            "shipping_address": _safe_cell(row, COL_ADDRESS),
+            "delivery_instructions": _safe_cell(row, COL_DELIVERY_INSTR),
+            "city": _safe_cell(row, COL_CITY),
+            "state": _safe_cell(row, COL_STATE),
+            "zip": _safe_cell(row, COL_ZIPCODE),
+            "country": "US",  # Default to US
             "raw": row,
         })
-    logger.info("Found %d eligible order(s) with ASIN/SKU", len(eligible))
+
+    logger.info("Found %d eligible order(s) (Price and Delivery Date both empty)", len(eligible))
     return eligible
 
 
@@ -229,7 +248,7 @@ def run_demo(sheet_id: str, max_retries: int = 2) -> dict[str, Any]:
     for order in orders:
         order_id = order.get("order_id", "unknown")
         row_number = order.get("row_number")
-        asin = (order.get("asin_sku") or "").strip()
+        asin = (order.get("asin") or "").strip()
         qty = _parse_qty(order.get("qty") or "1")
         buyer_name = order.get("buyer_name", "").strip()
         shipping_address = order.get("shipping_address", "").strip()
@@ -279,40 +298,8 @@ def run_demo(sheet_id: str, max_retries: int = 2) -> dict[str, Any]:
                 # before re-running the demo.
                 if (
                     not result.success
-                    and isinstance(last_result.detail.get("error_type"), str)
-                    and "sign_in" in last_result.detail["error_type"].lower()
-                ):
-                    logger.warning(
-                        "Order %s hit an unrecoverable sign-in wall. Set status "
-                        "to Error with an operator-facing message.",
-                        order_id,
-                    )
-                    order_success = False
-                    break
-
-                # Sign-in wall that we could not recover from with a logged-in
-                # session: the operator needs to run bootstrap_amazon_session.py
-                # before re-running the demo.
-                if (
-                    not result.success
-                    and isinstance(last_result.detail.get("error_type"), str)
-                    and "sign_in" in last_result.detail["error_type"].lower()
-                ):
-                    logger.warning(
-                        "Order %s hit an unrecoverable sign-in wall. Set status "
-                        "to Error with an operator-facing message.",
-                        order_id,
-                    )
-                    order_success = False
-                    break
-
-                # Sign-in wall that we could not recover from with a logged-in
-                # session: the operator needs to run bootstrap_amazon_session.py
-                # before re-running the demo.
-                if (
-                    not result.success
-                    and isinstance(last_result.detail.get("error_type"), str)
-                    and "sign_in" in last_result.detail["error_type"].lower()
+                    and isinstance(result.detail.get("error_type"), str)
+                    and "sign_in" in result.detail["error_type"].lower()
                 ):
                     logger.warning(
                         "Order %s hit an unrecoverable sign-in wall. Set status "
@@ -345,7 +332,7 @@ def run_demo(sheet_id: str, max_retries: int = 2) -> dict[str, Any]:
                 logger.info("Order %s -- %s: %s", order_id, type(exc).__name__, exc.reason)
                 sign_in_wall = isinstance(exc, SignInWallError)
                 last_result = CheckoutResult(
-                    order_id=asin,
+                    order_id=order_id,
                     asin=asin,
                     quantity=qty,
                     success=False,
@@ -377,7 +364,7 @@ def run_demo(sheet_id: str, max_retries: int = 2) -> dict[str, Any]:
                     exc.reason,
                 )
                 last_result = CheckoutResult(
-                    order_id=asin,
+                    order_id=order_id,
                     asin=asin,
                     quantity=qty,
                     success=False,

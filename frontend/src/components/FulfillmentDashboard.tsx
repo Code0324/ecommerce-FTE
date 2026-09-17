@@ -11,11 +11,7 @@ import {
   type TaskStatus,
 } from "@/lib/api";
 import OrdersSection from "@/components/OrdersSection";
-import InventorySection from "@/components/InventorySection";
-import AutomationSandbox from "@/components/AutomationSandbox";
-import AddressProcessing from "@/components/AddressProcessing";
 import FulfillmentWorkflowComponent from "@/components/FulfillmentWorkflow";
-import MockAmazonOrders from "@/components/MockAmazonOrders";
 import AmazonSandboxStatus from "@/components/AmazonSandboxStatus";
 
 // ---------------------------------------------------------------------------
@@ -365,38 +361,14 @@ export default function FulfillmentDashboard() {
         {/* ---- Divider ---- */}
         <hr className="border-gray-200" />
 
-        {/* ---- Inventory Section ---- */}
-        <InventorySection />
-
-        {/* ---- Divider ---- */}
-        <hr className="border-gray-200" />
-
         {/* ---- Fulfillment Workflow Section ---- */}
         <FulfillmentWorkflowComponent />
 
         {/* ---- Divider ---- */}
         <hr className="border-gray-200" />
 
-        {/* ---- Address Processing Section ---- */}
-        <AddressProcessing />
-
-        {/* ---- Divider ---- */}
-        <hr className="border-gray-200" />
-
         {/* ---- Amazon Sandbox Status Section ---- */}
         <AmazonSandboxStatus />
-
-        {/* ---- Divider ---- */}
-        <hr className="border-gray-200" />
-
-        {/* ---- Mock Amazon Orders Section ---- */}
-        <MockAmazonOrders />
-
-        {/* ---- Divider ---- */}
-        <hr className="border-gray-200" />
-
-        {/* ---- Automation Sandbox Section ---- */}
-        <AutomationSandbox />
       </main>
     </div>
   );

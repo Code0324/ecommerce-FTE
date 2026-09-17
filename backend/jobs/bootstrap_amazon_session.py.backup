@@ -1,0 +1,655 @@
+"""Standalone script to bootstrap a logged-in Amazon browser session.
+
+This is a ONE-TIME, human-assisted bootstrap. It opens a real headed browser
+and waits for a human to complete login (including any 2FA/OTP) manually.
+
+Never stores passwords. The resulting session (cookies + local storage) is
+saved to backend/credentials/amazon_buyer_session.json and loaded later by
+the guest-checkout flow when Amazon surfaces a sign-in wall.
+
+IMPORTANT SECURITY NOTES
+------------------------
+- This script calls input() -- it blocks the terminal until a human presses
+  Enter. It is NOT safe to call this from a background job or cron.
+- The saved session file is sensitive (it contains live cookies). It must
+  live under backend/credentials/ and be gitignored (already covered by the
+  repo .gitignore entry for backend/credentials/).
+- If the session file goes stale (Amazon signs out, cookies expire), the
+  checkout flow will detect the sign-in page and report an Error with a
+  message telling the operator to re-run this script.
+
+Usage:
+    cd backend
+    python -m jobs.bootstrap_amazon_session
+
+What it does:
+    1. Launches a headed Chromium via Playwright with proxy (if configured).
+    2. Navigates to Amazon homepage and clicks Sign In button naturally.
+    3. Waits for the operator to complete login + 2FA in the browser.
+    4. Verifies genuine authentication (auth cookie, currency, nav elements).
+    5. Retries up to 3 times without closing the browser.
+    6. Saves storage_state to backend/credentials/amazon_buyer_session.json.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import textwrap
+import traceback
+from pathlib import Path
+from typing import Any
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_DIR = os.path.dirname(_FILE_DIR)
+_REPO_ROOT = os.path.dirname(_BACKEND_DIR)
+
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from dotenv import load_dotenv
+from app.core.config import settings
+
+load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
+
+
+def _resolve_repo_path(value: str | None, relative_to_repo_root: str) -> str:
+    if value is None:
+        return os.path.normpath(os.path.join(_REPO_ROOT, relative_to_repo_root))
+
+    raw = os.path.expandvars(os.path.expanduser(value.strip()))
+    if os.path.isabs(raw):
+        return os.path.normpath(raw)
+
+    lowered = raw.lower()
+    if lowered.startswith("backend/") or lowered.startswith("backend\\"):
+        return os.path.normpath(os.path.join(_REPO_ROOT, raw))
+
+    return os.path.normpath(os.path.join(_REPO_ROOT, raw))
+
+
+SESSION_FILE = _resolve_repo_path(
+    getattr(settings, "AMAZON_BUYER_SESSION_PATH", None),
+    "backend/credentials/amazon_buyer_session.json",
+)
+CREDENTIALS_DIR = os.path.dirname(SESSION_FILE)
+SCREENSHOTS_DIR = os.path.normpath(os.path.join(_REPO_ROOT, "backend/screenshots"))
+HOMEPAGE_URL = "https://www.amazon.com/"
+MAX_LOGIN_ATTEMPTS = 3
+
+
+# ---------------------------------------------------------------------------
+# Playwright dependency check
+# ---------------------------------------------------------------------------
+
+
+def _ensure_playwright() -> None:
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright is not installed. Run: pip install playwright && "
+            "python -m playwright install chromium"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Strong Session Verification (FIX: Bug #2, #3, #5)
+# ---------------------------------------------------------------------------
+
+
+def _is_signin_form_visible(page: Any) -> bool:
+    """Return True if an ACTUAL signin form is visible (not just HTML existing).
+
+    FIX Bug #1: Weak detection - check for visible form elements, not text.
+    """
+    try:
+        # Check for visible email input field (most reliable)
+        email_field = page.locator(
+            'input[id="ap_email"], input[id="ap_email_login"], input[name="email"]'
+        ).first
+        if email_field.count() > 0:
+            if email_field.is_visible(timeout=2000):
+                logger.info("✗ SIGNIN FORM DETECTED: Email field is visible")
+                return True
+    except Exception:
+        pass
+
+    # Fallback: check page content for signin indicators (but require multiple)
+    try:
+        content = page.content().lower()
+        signin_phrases = [
+            "sign in to your account",
+            "enter your password",
+            'id="ap_email"',
+            'id="ap_password"',
+        ]
+        count = sum(1 for phrase in signin_phrases if phrase in content)
+        if count >= 2:
+            logger.warning("⚠ Signin indicators detected in page HTML (but form may not be visible)")
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _has_authenticated_nav_elements(page: Any) -> bool:
+    """Check for nav elements that ONLY appear when authenticated.
+
+    FIX Bug #1: Verify elements are actually visible, not just in HTML.
+    """
+    try:
+        content = page.content()
+        content_lower = content.lower()
+
+        # Check for authenticated-specific nav links
+        authenticated_indicators = [
+            'id="nav-link-orders"',
+            'id="nav-link-your-account"',
+            'href="/your-account"',
+            'href="/a/settings"',
+        ]
+
+        found = sum(1 for ind in authenticated_indicators if ind in content_lower)
+        if found >= 1:
+            logger.info("✓ Found authenticated nav elements in page HTML")
+            return True
+
+        logger.warning("✗ No authenticated nav elements found")
+        return False
+    except Exception as e:
+        logger.error(f"Could not check nav elements: {e}")
+        return False
+
+
+def _verify_auth_cookie_present(context: Any) -> bool:
+    """MANDATORY: Verify sst-main cookie is present and non-empty.
+
+    FIX Bug #5: Make auth cookie REQUIRED, not optional.
+    Regression: proxy disabled, caused Pakistan region. Auth cookie proves real auth.
+    """
+    try:
+        cookies = context.cookies()
+        for cookie in cookies:
+            if cookie.get("name") == "sst-main":
+                value = cookie.get("value", "").strip()
+                if value and len(value) > 10:
+                    logger.info("✓ Auth cookie found: sst-main (valid)")
+                    return True
+                logger.warning(f"✗ Auth cookie sst-main is empty or too short: {len(value)} chars")
+                return False
+
+        logger.error("✗ CRITICAL: Auth cookie sst-main NOT FOUND")
+        return False
+    except Exception as e:
+        logger.error(f"Error checking auth cookie: {e}")
+        return False
+
+
+def _verify_currency_is_usd(context: Any) -> bool:
+    """Verify i18n-prefs is USD or absent (NOT PKR).
+
+    FIX Bug #2: Re-check currency after proxy verification.
+    Regression: proxy disabled here before, caused Pakistan region.
+    """
+    try:
+        cookies = context.cookies()
+        for cookie in cookies:
+            if cookie.get("name") == "i18n-prefs":
+                value = cookie.get("value", "")
+                logger.info(f"[DEBUG] i18n-prefs cookie: {value}")
+
+                if "PKR" in value:
+                    logger.error("✗ FAILED: Pakistan region detected!")
+                    logger.error("Proxy may have disconnected during signin.")
+                    logger.error("Regression: proxy disabled here before, caused Pakistan region")
+                    return False
+
+                if "USD" in value or "en_US" in value:
+                    logger.info("✓ Currency is USD")
+                    return True
+
+                logger.warning(f"⚠ Unexpected currency value: {value}")
+                return True  # Allow other regions, but warn
+
+        logger.info("✓ No i18n-prefs cookie (defaults to US)")
+        return True
+    except Exception as e:
+        logger.error(f"Error checking currency: {e}")
+        return False
+
+
+def _verify_logged_in(context: Any, page: Any) -> bool:
+    """Verify genuine authentication with all checks.
+
+    FIX Bugs #1, #2, #5: Strong checks in order.
+    """
+    logger.info("\n" + "=" * 72)
+    logger.info("VERIFICATION: Checking all authentication criteria")
+    logger.info("=" * 72)
+
+    # Check 1: NOT on a signin form
+    if _is_signin_form_visible(page):
+        logger.error("✗ FAILED: Signin form still visible on page")
+        return False
+
+    # Check 2: MANDATORY - Auth cookie present
+    if not _verify_auth_cookie_present(context):
+        logger.error("✗ FAILED: Auth cookie missing (CRITICAL)")
+        return False
+
+    # Check 3: Currency is USD (not PKR)
+    if not _verify_currency_is_usd(context):
+        logger.error("✗ FAILED: Currency check failed")
+        return False
+
+    # Check 4: Authenticated nav elements
+    if not _has_authenticated_nav_elements(page):
+        logger.error("✗ FAILED: No authenticated nav elements")
+        return False
+
+    logger.info("✓✓✓ VERIFICATION PASSED: All checks successful")
+    return True
+
+
+def _take_screenshot(page: Any, filename: str) -> None:
+    """Capture a screenshot and save it to backend/screenshots/.
+
+    FIX Bug #9: Add detailed screenshots during login.
+    """
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+    filepath = os.path.join(SCREENSHOTS_DIR, filename)
+    try:
+        page.screenshot(path=filepath)
+        logger.info(f"✓ Screenshot saved: {filepath}")
+    except Exception as e:
+        logger.warning(f"✗ Failed to take screenshot: {e}")
+
+
+def _re_verify_proxy_after_navigation(page: Any) -> bool:
+    """Re-verify proxy is working AFTER navigating to signin page.
+
+    FIX Bug #2: Proxy can drop silently during navigation.
+    Regression: proxy disabled here before, caused Pakistan region.
+    """
+    logger.info("\n" + "=" * 72)
+    logger.info("PROXY RE-VERIFICATION (after signin navigation)")
+    logger.info("=" * 72)
+
+    try:
+        import httpx
+
+        proxy_config = settings.proxy_config
+        if not proxy_config:
+            logger.warning("⚠ No proxy configured (will use direct connection)")
+            return True
+
+        logger.info(f"Verifying proxy: {proxy_config.get('server')}")
+
+        with httpx.Client(
+            proxy=f"http://{proxy_config['username']}:{proxy_config['password']}@{proxy_config['server']}",
+            timeout=10.0
+        ) as client:
+            response = client.get("https://httpbin.org/ip")
+            data = response.json()
+            ip = data.get("origin", "unknown")
+            logger.info(f"✓ Proxy working - IP: {ip}")
+
+            # Check if it's still US-based (simple heuristic)
+            if "Pakistan" in data.get("country", "") or ip.startswith("103."):
+                logger.error("✗ PROXY WARNING: Detected Pakistan/non-US IP!")
+                logger.error("Regression: proxy disabled, caused Pakistan region")
+                return False
+
+            return True
+
+    except Exception as e:
+        logger.warning(f"⚠ Proxy re-verification failed: {e}")
+        logger.warning("Continuing anyway (will check currency cookie later)")
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Main bootstrap
+# ---------------------------------------------------------------------------
+
+
+def run_bootstrap() -> Path:
+    """Run the interactive Amazon session bootstrap.
+
+    Returns the path to the saved storage_state file.
+    """
+    _ensure_playwright()
+    os.makedirs(CREDENTIALS_DIR, exist_ok=True)
+
+    from playwright.sync_api import sync_playwright
+
+    browser = None
+    context = None
+    page = None
+
+    try:
+        with sync_playwright() as pw:
+            logger.info("\n" + "=" * 72)
+            logger.info("LAUNCHING BROWSER")
+            logger.info("=" * 72)
+
+            try:
+                proxy_config = settings.proxy_config
+                if proxy_config:
+                    logger.info(f"✓ Proxy configured: {proxy_config.get('server')}")
+                else:
+                    logger.warning("⚠ No proxy configured")
+
+                # Launch browser with proxy persisted throughout
+                # Regression fix: proxy disabled here before, caused Pakistan region
+                browser = pw.chromium.launch(
+                    headless=False,
+                    args=["--disable-blink-features=AutomationControlled"],
+                    proxy=proxy_config,
+                )
+                logger.info("✓ Browser launched")
+            except Exception as e:
+                logger.error(f"\n✗ FATAL: Failed to launch browser: {e}")
+                raise
+
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1366, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                )
+                logger.info("✓ Browser context created")
+            except Exception as e:
+                logger.error(f"\n✗ FATAL: Failed to create context: {e}")
+                raise
+
+            try:
+                page = context.new_page()
+                logger.info("✓ Page created")
+
+                # STEP 1: Navigate to Amazon homepage
+                # Regression fix: bare signin URL 404s without OpenID params
+                logger.info("\n[STEP 1] Navigating to Amazon homepage...")
+                page.goto(HOMEPAGE_URL, timeout=60000, wait_until="domcontentloaded")
+                logger.info("✓ Homepage loaded")
+
+                # STEP 2: Wait for page to settle (not fixed timeout)
+                # FIX Bug #8: Use networkidle instead of fixed 2 seconds
+                logger.info("[STEP 2] Waiting for page to settle...")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    logger.info("✓ Page settled (network idle)")
+                except Exception:
+                    logger.warning("⚠ Page didn't reach network idle (continuing)")
+                    page.wait_for_timeout(3000)
+
+                # STEP 2b: Wait for account menu to be visible before searching for Sign In
+                # FIX Bug #8: Ensure account/nav area is ready before button search
+                logger.info("[STEP 2b] Waiting for account menu area...")
+                try:
+                    page.locator("#nav-account-flyout-trigger, .nav-signin-lang-icon").first.wait_for(
+                        state="attached", timeout=5000
+                    )
+                    logger.info("✓ Account menu area is ready")
+                except Exception:
+                    logger.warning("⚠ Account menu not detected (continuing anyway)")
+
+                # STEP 3: Find and click Sign In button
+                # FIX: Try primary selector first, then text-based fallback, only error if both fail
+                logger.info("[STEP 3] Looking for Sign In button...")
+                signin_clicked = False
+
+                # Try primary selector (.nav-action-signin-button) first
+                try:
+                    logger.info("  Trying primary selector (.nav-action-signin-button)...")
+                    elem = page.locator(".nav-action-signin-button").first
+                    if elem.count() > 0 and elem.is_visible(timeout=3000):
+                        logger.info("✓ Found Sign In button (primary selector)")
+                        elem.click()
+                        signin_clicked = True
+                        logger.info("✓ Clicked Sign In - Amazon generating signin URL")
+                        page.wait_for_timeout(2000)
+                except Exception as e:
+                    logger.debug(f"  Primary selector failed: {e}")
+
+                # If primary selector didn't work, try text-based fallback
+                if not signin_clicked:
+                    try:
+                        logger.info("  Trying text-based fallback (page.get_by_text('Sign in'))...")
+                        elem = page.get_by_text("Sign in", exact=False).first
+                        if elem.count() > 0 and elem.is_visible(timeout=3000):
+                            logger.info("✓ Found Sign In button (text fallback)")
+                            elem.click()
+                            signin_clicked = True
+                            logger.info("✓ Clicked Sign In - Amazon generating signin URL")
+                            page.wait_for_timeout(2000)
+                    except Exception as e:
+                        logger.debug(f"  Text fallback failed: {e}")
+
+                # Only raise error if BOTH primary and fallback genuinely failed
+                if not signin_clicked:
+                    logger.error("✗ Could not find Sign In button (both primary and text fallback failed)")
+                    logger.error("The account menu may not be visible yet or the page structure changed")
+                    raise RuntimeError(
+                        "Failed to locate Sign In button after trying primary selector and text fallback. "
+                        "The page may not be fully loaded or the button may be hidden."
+                    )
+
+                # STEP 4: Wait for signin page to load and settle
+                logger.info("[STEP 4] Waiting for signin page to load...")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    logger.info("✓ Signin page loaded (network idle)")
+                except Exception:
+                    logger.warning("⚠ Signin page didn't reach network idle")
+                    page.wait_for_timeout(3000)
+
+                # STEP 5: Re-verify proxy after navigation
+                # FIX Bug #2: Proxy can drop silently during navigation
+                _re_verify_proxy_after_navigation(page)
+
+                logger.info(f"Current URL: {page.url}")
+                _take_screenshot(page, "bootstrap_01_signin_page.png")
+
+            except Exception as e:
+                logger.error(f"\n✗ FATAL: Failed to navigate to signin: {e}")
+                raise
+
+            # RETRY LOOP: Keep browser open, reuse same page
+            attempt = 0
+            while attempt < MAX_LOGIN_ATTEMPTS:
+                attempt += 1
+
+                logger.info("")
+                logger.info("=" * 72)
+                logger.info(f"ATTEMPT {attempt} of {MAX_LOGIN_ATTEMPTS}")
+                logger.info("=" * 72)
+
+                if attempt == 1:
+                    logger.info(
+                        textwrap.dedent(
+                            """
+                            The browser is OPEN showing Amazon's sign-in page.
+
+                            INSTRUCTIONS:
+                            1. Log in with your email + password
+                            2. Complete 2FA/OTP if Amazon prompts
+                            3. Wait for redirect to the Amazon homepage
+                            4. When logged in, return to this terminal
+                            5. Press Enter to verify login
+                            """
+                        ).strip()
+                    )
+                else:
+                    logger.warning(
+                        textwrap.dedent(
+                            """
+                            Previous verification didn't detect a logged-in session.
+                            The browser is still open. Complete login if needed.
+                            Return here and press Enter to verify again.
+                            """
+                        ).strip()
+                    )
+
+                # FIX Bug #9: Take screenshot BEFORE waiting, AFTER each attempt
+                _take_screenshot(page, f"bootstrap_02_attempt_{attempt}_before.png")
+
+                # Wait for user to complete login
+                try:
+                    logger.info(
+                        f"\n[Attempt {attempt}/{MAX_LOGIN_ATTEMPTS}] "
+                        "Press Enter when logged in on the Amazon homepage: "
+                    )
+                    input("")
+                except EOFError:
+                    logger.info("Non-interactive mode - waiting 300 seconds for login...")
+                    for i in range(60):
+                        page.wait_for_timeout(5000)
+                        if "signin" not in page.url.lower():
+                            logger.info("✓ Navigation away from signin detected")
+                            break
+
+                # FIX Bug #9: Take screenshot AFTER user presses Enter
+                _take_screenshot(page, f"bootstrap_03_attempt_{attempt}_after_enter.png")
+
+                # Wait for page to settle after login
+                logger.info("Waiting for page to settle after login...")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    logger.info("✓ Page settled (network idle)")
+                except Exception:
+                    logger.warning("⚠ Page didn't reach network idle (continuing)")
+                    page.wait_for_timeout(3000)
+
+                # HANDLE ACCOUNT PICKER: if multiple accounts, select ummay480@gmail.com
+                # FIX Bug #4: Try multiple selectors for account picker
+                current_url = page.url
+                if "switch_account=picker" in current_url.lower():
+                    logger.info("⚠ Account picker page detected")
+                    try:
+                        email_to_find = "ummay480@gmail.com"
+                        account_selectors = [
+                            ("text-based", lambda: page.get_by_text(email_to_find, exact=False).first),
+                            ("role-based", lambda: page.get_by_role("button", name=email_to_find, exact=False).first),
+                            ("aria-label", lambda: page.locator(f'[aria-label*="{email_to_find}"]').first),
+                        ]
+
+                        found = False
+                        for selector_type, locator_fn in account_selectors:
+                            try:
+                                elem = locator_fn()
+                                if elem.count() > 0 and elem.is_visible(timeout=2000):
+                                    logger.info(f"✓ Found account ({selector_type})")
+                                    elem.click()
+                                    page.wait_for_timeout(3000)
+                                    logger.info("✓ Account selected")
+                                    found = True
+                                    break
+                            except Exception as e:
+                                logger.debug(f"  {selector_type} failed: {e}")
+
+                        if not found:
+                            logger.warning("⚠ Could not find account - may proceed with current account")
+
+                    except Exception as e:
+                        logger.warning(f"⚠ Account picker error: {e}")
+
+                # Verify authentication with all checks
+                try:
+                    if _verify_logged_in(context, page):
+                        # All verification checks passed - save session
+                        logger.info("\n" + "=" * 72)
+                        logger.info("SAVING SESSION")
+                        logger.info("=" * 72)
+                        logger.info(f"Saving to: {SESSION_FILE}")
+
+                        # Only save once ALL verification passes
+                        # Regression fix: weak text-match caused false-positive saved sessions
+                        context.storage_state(path=SESSION_FILE)
+                        logger.info("✓ Session saved successfully")
+                        logger.info("Checkout automation can now use this session.")
+
+                        _take_screenshot(page, "bootstrap_04_success_homepage.png")
+                        return Path(SESSION_FILE)
+                    else:
+                        logger.error("✗ Verification failed - will retry")
+                        _take_screenshot(page, f"bootstrap_05_attempt_{attempt}_failed.png")
+                        continue
+
+                except Exception as e:
+                    # Regression fix: force-closing on error caused wasted logins
+                    logger.error(f"\n✗ ERROR during verification (attempt {attempt}): {e}")
+                    logger.warning("Will retry with same browser session...")
+                    _take_screenshot(page, f"bootstrap_05_attempt_{attempt}_error.png")
+                    continue
+
+            # All attempts exhausted
+            logger.error("\n" + "=" * 72)
+            logger.error(f"Could not bootstrap session after {MAX_LOGIN_ATTEMPTS} attempts")
+            logger.error("Do not run checkout automation yet - it will fail.")
+            logger.error("=" * 72)
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"\n✗ FATAL ERROR: {type(e).__name__}: {e}")
+        logger.error("Full traceback:")
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if browser:
+            try:
+                browser.close()
+                logger.info("Browser closed")
+            except Exception:
+                pass
+
+
+def main() -> None:
+    print()
+    print("=" * 72)
+    print("AMAZON BUYER SESSION BOOTSTRAP")
+    print("=" * 72)
+    print()
+    print(
+        "This script opens a REAL browser window and waits for YOU to log in "
+        "to Amazon manually."
+    )
+    print("No password is stored anywhere. Only the resulting browser session")
+    print("(cookies + local storage) is saved to disk.")
+    print()
+    print(f"Session will be saved to: {SESSION_FILE}")
+    print()
+    print("=" * 72)
+    print()
+
+    path = run_bootstrap()
+    print()
+    print("Bootstrap complete.")
+    print(f"Session saved to: {path}")
+    print()
+    print("Next step: re-run the checkout demo:")
+    print("    cd backend")
+    print("    python -m jobs.demo_guest_checkout_fulfillment")
+    print()
+
+
+if __name__ == "__main__":
+    main()

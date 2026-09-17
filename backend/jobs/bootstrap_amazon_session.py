@@ -1,7 +1,8 @@
 """Standalone script to bootstrap a logged-in Amazon browser session.
 
 This is a ONE-TIME, human-assisted bootstrap. It opens a real headed browser
-and waits for a human to complete login (including any 2FA/OTP) manually.
+with a persistent Chrome profile and waits for a human to complete login
+(including any 2FA/OTP) manually.
 
 Never stores passwords. The resulting session (cookies + local storage) is
 saved to backend/credentials/amazon_buyer_session.json and loaded later by
@@ -23,13 +24,12 @@ Usage:
     python -m jobs.bootstrap_amazon_session
 
 What it does:
-    1. Launches a headed Chromium via Playwright.
-    2. Navigates to https://www.amazon.com/ap/signin
-    3. Prints instructions and waits for the operator to press Enter.
-    4. Verifies the session looks logged in (Amazon homepage shows a greeting /
-       account name rather than a sign-in page).
-    5. If not logged in, warns and offers a retry (up to a small number).
-    6. Saves storage_state to backend/credentials/amazon_buyer_session.json.
+    1. Launches a headed Chrome browser via Patchright with persistent profile.
+    2. Navigates to Amazon homepage and detects authentication status.
+    3. If not authenticated: waits for manual login + 2FA in the browser.
+    4. Verifies genuine authentication (auth cookie, currency, nav elements).
+    5. Saves storage_state to backend/credentials/amazon_buyer_session.json.
+    6. Closes the browser cleanly.
 """
 
 from __future__ import annotations
@@ -52,9 +52,6 @@ logger = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-# This file lives at:
-#   {repo_root}/backend/jobs/bootstrap_amazon_session.py
-# So the backend/ directory is 2 levels above __file__, and the repo root is 3 levels above.
 _FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 _BACKEND_DIR = os.path.dirname(_FILE_DIR)
 _REPO_ROOT = os.path.dirname(_BACKEND_DIR)
@@ -66,6 +63,7 @@ from dotenv import load_dotenv
 from app.core.config import settings
 
 load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
+
 
 def _resolve_repo_path(value: str | None, relative_to_repo_root: str) -> str:
     if value is None:
@@ -88,80 +86,160 @@ SESSION_FILE = _resolve_repo_path(
 )
 CREDENTIALS_DIR = os.path.dirname(SESSION_FILE)
 SCREENSHOTS_DIR = os.path.normpath(os.path.join(_REPO_ROOT, "backend/screenshots"))
+AMAZON_PROFILE_DIR = os.path.normpath(os.path.join(_REPO_ROOT, "amazon-chrome-profile"))
 HOMEPAGE_URL = "https://www.amazon.com/"
 
-# How many login attempts we allow before giving up.
-MAX_LOGIN_ATTEMPTS = 3
-
 
 # ---------------------------------------------------------------------------
-# Playwright dependency check
+# Patchright dependency check
 # ---------------------------------------------------------------------------
 
 
-def _ensure_playwright() -> None:
+def _ensure_patchright() -> None:
     try:
-        import playwright.sync_api  # noqa: F401
+        import patchright.sync_api  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "playwright is not installed. Run: pip install playwright && "
-            "python -m playwright install chromium"
+            "patchright is not installed. Run: pip install patchright --break-system-packages && "
+            "python -m patchright install chrome"
         ) from exc
 
 
 # ---------------------------------------------------------------------------
-# Session verification
+# Strong Session Verification
 # ---------------------------------------------------------------------------
 
-_SIGNIN_PAGE_INDICATORS = [
-    "sign in to your account",
-    "enter your password",
-    'id="ap_email"',
-    'id="ap_email_login"',  # Amazon changed email field ID
-    'id="ap_password"',
-    "keep shopping",
-]
 
+def _is_signin_form_visible(page: Any) -> bool:
+    """Return True if an ACTUAL signin form is visible (not just HTML existing)."""
+    try:
+        email_field = page.locator(
+            'input[id="ap_email"], input[id="ap_email_login"], input[name="email"]'
+        ).first
+        if email_field.count() > 0:
+            if email_field.is_visible(timeout=2000):
+                logger.info("✗ SIGNIN FORM DETECTED: Email field is visible")
+                return True
+    except Exception:
+        pass
 
-def _is_sign_in_page(page: Any) -> bool:
-    """Return True if the current page still looks like a sign-in page."""
     try:
         content = page.content().lower()
+        signin_phrases = [
+            "sign in to your account",
+            "enter your password",
+            'id="ap_email"',
+            'id="ap_password"',
+        ]
+        count = sum(1 for phrase in signin_phrases if phrase in content)
+        if count >= 2:
+            logger.warning("⚠ Signin indicators detected in page HTML (but form may not be visible)")
+            return True
     except Exception:
-        return True  # assume not logged in if we can't read the page
-    return any(s in content for s in _SIGNIN_PAGE_INDICATORS)
+        pass
+
+    return False
 
 
-def _page_has_account_greeting(page: Any) -> bool:
-    """Return True if the page appears to show a logged-in account greeting.
-
-    Amazon's logged-in homepage usually shows "Hello, Name" or a account
-    menu with the account holder's name. We check for a few common signals.
-    """
+def _has_authenticated_nav_elements(page: Any) -> bool:
+    """Check for nav elements that ONLY appear when authenticated."""
     try:
-        content = page.content().lower()
-    except Exception:
+        content = page.content()
+        content_lower = content.lower()
+
+        authenticated_indicators = [
+            'hello,',
+            'account & lists',
+            'returns & orders',
+            'id="nav-account-flyout-trigger"',
+            'id="nav-link-orders"',
+            'id="nav-link-your-account"',
+        ]
+
+        found = sum(1 for ind in authenticated_indicators if ind in content_lower)
+        if found >= 1:
+            logger.info("✓ Found authenticated nav elements in page HTML")
+            return True
+
+        logger.warning("✗ No authenticated nav elements found")
+        return False
+    except Exception as e:
+        logger.error(f"Could not check nav elements: {e}")
         return False
 
-    greetings = [
-        "hello,",
-        "account",
-        "your lists",
-        "recommendations for you",
-        'id="nav-link-accountList"',
-    ]
-    return any(g in content for g in greetings)
 
+def _verify_auth_cookie_present(context: Any) -> bool:
+    """MANDATORY: Verify sst-main cookie is present and non-empty."""
+    try:
+        cookies = context.cookies()
+        for cookie in cookies:
+            if cookie.get("name") == "sst-main":
+                value = cookie.get("value", "").strip()
+                if value and len(value) > 10:
+                    logger.info("✓ Auth cookie found: sst-main (valid)")
+                    return True
+                logger.warning(f"✗ Auth cookie sst-main is empty or too short: {len(value)} chars")
+                return False
 
-def _verify_logged_in(page: Any) -> bool:
-    """Check whether the browser appears to be logged in.
-
-    Returns True if the homepage shows a logged-in signal AND is not a
-    sign-in page.
-    """
-    if _is_sign_in_page(page):
+        logger.error("✗ CRITICAL: Auth cookie sst-main NOT FOUND")
         return False
-    return _page_has_account_greeting(page)
+    except Exception as e:
+        logger.error(f"Error checking auth cookie: {e}")
+        return False
+
+
+def _verify_currency_is_usd(context: Any) -> bool:
+    """Verify i18n-prefs is USD or absent (NOT PKR)."""
+    try:
+        cookies = context.cookies()
+        for cookie in cookies:
+            if cookie.get("name") == "i18n-prefs":
+                value = cookie.get("value", "")
+                logger.info(f"[DEBUG] i18n-prefs cookie: {value}")
+
+                if "PKR" in value:
+                    logger.error("✗ FAILED: Pakistan region detected!")
+                    logger.error("Proxy may have disconnected during signin.")
+                    return False
+
+                if "USD" in value or "en_US" in value:
+                    logger.info("✓ Currency is USD")
+                    return True
+
+                logger.warning(f"⚠ Unexpected currency value: {value}")
+                return True
+
+        logger.info("✓ No i18n-prefs cookie (defaults to US)")
+        return True
+    except Exception as e:
+        logger.error(f"Error checking currency: {e}")
+        return False
+
+
+def _verify_logged_in(context: Any, page: Any) -> bool:
+    """Verify genuine authentication with all checks."""
+    logger.info("\n" + "=" * 72)
+    logger.info("VERIFICATION: Checking all authentication criteria")
+    logger.info("=" * 72)
+
+    if _is_signin_form_visible(page):
+        logger.error("✗ FAILED: Signin form still visible on page")
+        return False
+
+    if not _verify_auth_cookie_present(context):
+        logger.error("✗ FAILED: Auth cookie missing (CRITICAL)")
+        return False
+
+    if not _verify_currency_is_usd(context):
+        logger.error("✗ FAILED: Currency check failed")
+        return False
+
+    if not _has_authenticated_nav_elements(page):
+        logger.error("✗ FAILED: No authenticated nav elements")
+        return False
+
+    logger.info("✓✓✓ VERIFICATION PASSED: All checks successful")
+    return True
 
 
 def _take_screenshot(page: Any, filename: str) -> None:
@@ -170,9 +248,9 @@ def _take_screenshot(page: Any, filename: str) -> None:
     filepath = os.path.join(SCREENSHOTS_DIR, filename)
     try:
         page.screenshot(path=filepath)
-        logger.info("✓ Screenshot saved: %s", filepath)
+        logger.info(f"✓ Screenshot saved: {filepath}")
     except Exception as e:
-        logger.warning("✗ Failed to take screenshot: %s", str(e))
+        logger.warning(f"✗ Failed to take screenshot: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -181,588 +259,166 @@ def _take_screenshot(page: Any, filename: str) -> None:
 
 
 def run_bootstrap() -> Path:
-    """Run the interactive Amazon session bootstrap.
+    """Run the interactive Amazon session bootstrap with persistent profile.
 
     Returns the path to the saved storage_state file.
     """
-    _ensure_playwright()
-
+    _ensure_patchright()
     os.makedirs(CREDENTIALS_DIR, exist_ok=True)
+    os.makedirs(AMAZON_PROFILE_DIR, exist_ok=True)
 
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
 
-    # Launch Playwright ONCE for all retry attempts
-    # This keeps the browser open across retries
-    browser = None
     context = None
 
     try:
         with sync_playwright() as pw:
-            # Launch the browser BEFORE asking user for input
             logger.info("\n" + "=" * 72)
-            logger.info("LAUNCHING BROWSER")
+            logger.info("LAUNCHING BROWSER WITH PERSISTENT PROFILE")
             logger.info("=" * 72)
 
             try:
-                browser = pw.chromium.launch(
+                proxy_config = settings.proxy_config
+                if proxy_config:
+                    logger.info(f"✓ Proxy configured: {proxy_config.get('server')}")
+                else:
+                    logger.warning("⚠ No proxy configured (will use direct connection)")
+
+                # Launch with persistent profile and proxy
+                logger.info(f"Profile directory: {AMAZON_PROFILE_DIR}")
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir=AMAZON_PROFILE_DIR,
                     headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        # Removed: --no-sandbox (Linux-only, not needed on Windows)
-                        # Removed: --disable-dev-shm-usage (Linux-only, not needed on Windows)
-                    ],
-                    proxy=settings.proxy_config,
+                    channel="chrome",
+                    args=["--disable-blink-features=AutomationControlled"],
+                    proxy=proxy_config,
                 )
-                logger.info("✓ Browser launched successfully")
+                logger.info("✓ Browser launched with persistent profile")
             except Exception as e:
-                logger.error("\n✗ FATAL: Failed to launch browser")
-                logger.error("Exception type: %s", type(e).__name__)
-                logger.error("Exception message: %s", str(e))
-                logger.error("\nFull traceback:")
-                traceback.print_exc()
+                logger.error(f"\n✗ FATAL: Failed to launch browser: {e}")
                 raise
 
             try:
-                context = browser.new_context(
-                    viewport={"width": 1366, "height": 900},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                )
-                logger.info("✓ Browser context created successfully")
+                # Get or create a page
+                if context.pages:
+                    page = context.pages[0]
+                    logger.info("✓ Using existing page")
+                else:
+                    page = context.new_page()
+                    logger.info("✓ Page created")
 
-                # Add event listeners to detect close/crash events
-                def on_browser_disconnect():
-                    print("\n!!! BROWSER DISCONNECTED !!!\n")
-                    logger.error("!!! BROWSER DISCONNECTED !!!")
-
-                def on_context_close():
-                    print("\n!!! CONTEXT CLOSED !!!\n")
-                    logger.error("!!! CONTEXT CLOSED !!!")
-
-                browser.on("disconnected", on_browser_disconnect)
-                context.on("close", on_context_close)
-                logger.info("✓ Event listeners installed")
-
-            except Exception as e:
-                logger.error("\n✗ FATAL: Failed to create browser context")
-                logger.error("Exception type: %s", type(e).__name__)
-                logger.error("Exception message: %s", str(e))
-                logger.error("\nFull traceback:")
-                traceback.print_exc()
-                raise
-
-            # Create ONE page that persists across all retry attempts
-            try:
-                page = context.new_page()
-
-                def on_page_close():
-                    print("\n!!! PAGE CLOSED !!!\n")
-                    logger.error("!!! PAGE CLOSED !!!")
-
-                def on_page_crash():
-                    print("\n!!! PAGE CRASHED !!!\n")
-                    logger.error("!!! PAGE CRASHED !!!")
-
-                page.on("close", on_page_close)
-                page.on("crash", on_page_crash)
-                logger.info("✓ Page created with event listeners")
-
-                # Navigate to Amazon homepage first
-                logger.info("Navigating to Amazon homepage: %s", HOMEPAGE_URL)
+                # STEP 1: Navigate to Amazon homepage
+                logger.info("\n[STEP 1] Navigating to Amazon homepage...")
                 page.goto(HOMEPAGE_URL, timeout=60000, wait_until="domcontentloaded")
                 logger.info("✓ Homepage loaded")
 
-                # Wait for WAF challenge if present
-                page_html = page.content()
-                if "AwsWafIntegration" in page_html or "challenge" in page_html.lower():
-                    logger.warning("⚠ WAF challenge page detected, waiting for it to complete...")
-                    page.wait_for_timeout(5000)
-                    # Wait for navigation after WAF completion
-                    try:
-                        page.wait_for_url("https://www.amazon.com/", timeout=15000)
-                        logger.info("✓ WAF challenge completed, homepage loaded")
-                    except Exception:
-                        logger.warning("⚠ URL didn't match expected, but continuing...")
+                # STEP 2: Wait for page to settle
+                logger.info("[STEP 2] Waiting for page to settle...")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    logger.info("✓ Page settled (network idle)")
+                except Exception:
+                    logger.warning("⚠ Page didn't reach network idle (continuing)")
                     page.wait_for_timeout(3000)
+
+                # STEP 3: Check authentication status
+                logger.info("[STEP 3] Checking authentication status...")
+                is_authenticated = not _is_signin_form_visible(page)
+                if is_authenticated:
+                    logger.info("✓ Already authenticated (no signin form visible)")
                 else:
-                    page.wait_for_timeout(2000)
+                    logger.warning("⚠ Not authenticated - signin form is visible")
 
-                # DEBUG: Dump the page HTML to inspect structure
-                try:
-                    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-
-                    # Get full page HTML
-                    page_html = page.content()
-                    nav_dump_path = os.path.join(SCREENSHOTS_DIR, "nav-bar-html.txt")
-                    with open(nav_dump_path, "w", encoding="utf-8") as f:
-                        f.write(page_html)
-                    logger.info("✓ Full page HTML dumped to: %s", nav_dump_path)
-                    logger.info("File size: %d bytes", len(page_html))
-
-                    # Also check if this is still a WAF page
-                    if "challenge-container" in page_html or "AwsWafIntegration" in page_html:
-                        logger.error("✗ Still on WAF challenge page after waiting!")
-                except Exception as e:
-                    logger.warning("✗ Could not dump HTML: %s", str(e))
-
-                # Find and click the Sign In button/link
-                # The account menu has a button to expand the dropdown
-                logger.info("Looking for Account menu to expand dropdown...")
-                try:
-                    # Find the expand button (arrow) next to Account & Lists
-                    expand_button = page.locator("#nav-link-accountList .nav-flyout-button")
-
-                    if not expand_button.is_visible():
-                        raise Exception("#nav-link-accountList expand button not visible")
-
-                    # Click the expand button to open the dropdown
-                    expand_button.click()
-                    logger.info("✓ Clicked account menu expand button")
-                    page.wait_for_timeout(1500)
-
-                    # Find the "Sign in" button inside the dropdown
-                    # Primary: Try class-based selector "nav-action-signin-button"
-                    sign_in_button = None
-                    try:
-                        btn = page.locator(".nav-action-signin-button")
-                        if btn.is_visible():
-                            sign_in_button = btn
-                            logger.info("✓ Found Sign In button by class selector (.nav-action-signin-button)")
-                    except Exception:
-                        pass
-
-                    # Fallback 1: Try text-based locator for "Sign in"
-                    if not sign_in_button or not sign_in_button.is_visible():
-                        logger.warning("Class selector not found, trying text-based locator...")
-                        try:
-                            text_btn = page.get_by_text("Sign in", exact=False).first
-                            if text_btn.is_visible():
-                                sign_in_button = text_btn
-                                logger.info("✓ Found Sign In button by text locator (get_by_text)")
-                        except Exception as e:
-                            logger.warning("Text locator failed: %s", str(e))
-
-                    if not sign_in_button or not sign_in_button.is_visible():
-                        raise Exception("Could not find visible Sign In button with any selector")
-
-                    # Click the sign in button
-                    sign_in_button.click()
-                    logger.info("✓ Clicked Sign In button")
-                    page.wait_for_timeout(2000)
-
-                except Exception as e:
-                    logger.error("✗ FATAL: Failed to click Sign In button")
-                    logger.error("Exception: %s", str(e))
-                    _take_screenshot(page, "bootstrap_signin_click_failed.png")
-                    logger.error("Screenshot saved to bootstrap_signin_click_failed.png for debugging")
-                    raise
-
-                # Wait for the email input field to be visible (indicates real signin form)
-                logger.info("Waiting for signin form email field...")
-                current_url = page.url
-                logger.info("Current URL after clicking Sign In: %s", current_url)
-
-                # DEBUG: Dump signin page HTML to inspect form structure
-                try:
-                    page.wait_for_timeout(3000)  # Extra wait for dynamic content
-                    signin_html = page.content()
-                    signin_dump_path = os.path.join(SCREENSHOTS_DIR, "signin-page-html.txt")
-                    with open(signin_dump_path, "w", encoding="utf-8") as f:
-                        f.write(signin_html)
-                    logger.info("✓ Signin page HTML dumped to: %s", signin_dump_path)
-                    logger.info("File size: %d bytes", len(signin_html))
-                except Exception as e:
-                    logger.warning("✗ Could not dump signin HTML: %s", str(e))
-
-                try:
-                    # Try new field ID first (ap_email_login), then fallback to old (ap_email)
-                    email_field = None
-                    for email_id in ["ap_email_login", "ap_email"]:
-                        try:
-                            field = page.locator(f"#{email_id}")
-                            if field.is_visible(timeout=3000):
-                                email_field = field
-                                logger.info("✓ Found email field with ID: #%s", email_id)
-                                break
-                        except Exception:
-                            pass
-
-                    if not email_field:
-                        # Fallback: look for any input with type="email"
-                        email_field = page.locator('input[type="email"]').first
-                        if not email_field.is_visible(timeout=3000):
-                            raise Exception("Could not find email field with any selector")
-                        logger.info("✓ Found email field using type selector")
-
-                    logger.info("✓ Email field visible - real signin form loaded")
-                except Exception as e:
-                    logger.error("✗ Email field did not appear - may have landed on wrong page")
-                    logger.error("Exception: %s", str(e))
-                    logger.warning("Continuing anyway - may already be on signin page...")
-                    _take_screenshot(page, "bootstrap_signin_form_not_found.png")
-                    # Don't raise here - user might already be on the signin page
-                    # Just continue with manual input
-                    page.wait_for_timeout(1000)
-
-                # Take initial screenshot before any attempts
-                logger.info("Taking initial screenshot of signin form...")
-                _take_screenshot(page, "bootstrap_initial.png")
+                logger.info(f"Current URL: {page.url}")
+                _take_screenshot(page, "bootstrap_01_status.png")
 
             except Exception as e:
-                logger.error("\n✗ FATAL: Failed to create page or navigate to signin")
-                logger.error("Exception type: %s", type(e).__name__)
-                logger.error("Exception message: %s", str(e))
-                logger.error("\nFull traceback:")
-                traceback.print_exc()
+                logger.error(f"\n✗ FATAL: Failed to navigate to Amazon: {e}")
                 raise
 
-            # NOW the browser is open with the signin page ready - enter the retry loop
-            attempt = 0
-            while attempt < MAX_LOGIN_ATTEMPTS:
-                attempt += 1
-
-                logger.info("")
+            # MAIN FLOW: Verify authentication or wait for manual login
+            if not is_authenticated:
+                logger.info("\n" + "=" * 72)
+                logger.info("MANUAL LOGIN REQUIRED")
                 logger.info("=" * 72)
-                logger.info("ATTEMPT %d of %d", attempt, MAX_LOGIN_ATTEMPTS)
-                logger.info("=" * 72)
+                logger.info(
+                    textwrap.dedent(
+                        """
+                        The browser is OPEN showing Amazon's sign-in page.
 
-                if attempt == 1:
-                    logger.info(
-                        textwrap.dedent(
-                            f"""
-                            The browser is OPEN. Amazon's sign-in page should be visible.
+                        INSTRUCTIONS:
+                        1. In the browser window, log in with your Amazon email + password
+                        2. Complete 2FA/OTP if Amazon prompts
+                        3. Wait for redirect to the Amazon homepage
+                        4. When logged in, return to this terminal
+                        5. Press Enter to verify login
+                        """
+                    ).strip()
+                )
 
-                            INSTRUCTIONS:
-                            1. Log in with your email + password
-                            2. Complete 2FA/OTP if Amazon prompts for it
-                            3. Wait for redirect to the Amazon homepage
-                            4. When you're logged in and on the homepage, return to this terminal
-                            5. Press Enter below to verify login
+                _take_screenshot(page, "bootstrap_02_signin_required.png")
 
-                            DO NOT:
-                            - Close the browser window
-                            - Log out
-                            - Clear cookies or site data
-                            """
-                        ).strip()
-                    )
-                else:
-                    logger.warning(
-                        textwrap.dedent(
-                            f"""
-                            Previous attempt did not detect a logged-in session.
-                            The browser is still open showing the current page.
-
-                            Next steps:
-                            - If you're still on a sign-in or 2FA page: complete login now
-                            - If you're on the homepage: you're good
-                            - Use the browser's back button if needed
-
-                            Once ready, return here and press Enter to verify again.
-                            """
-                        ).strip()
-                    )
-
-                # ✓ NOW wait for user to complete login while browser is OPEN
-                # Log page count and state
-                open_pages = len(context.pages)
-                logger.info("\n[DEBUG] Open pages in context: %d", open_pages)
-                if open_pages > 0:
-                    logger.info("[DEBUG] Current page URL: %s", page.url)
-
-                # Take screenshot before waiting
-                logger.info("Taking screenshot before attempt %d...", attempt)
-                _take_screenshot(page, f"bootstrap_attempt_{attempt}.png")
-
-                # DEBUG: Check page state for signin
+                # Wait for user to complete login
                 try:
-                    email_value = page.input_value("#ap_email_login", timeout=2000)
-                    logger.info("[DEBUG] Email field value: %s", "***FILLED***" if email_value else "EMPTY")
-                except Exception:
-                    logger.info("[DEBUG] Could not read email field")
-
-                try:
-                    continue_btn = page.locator("#continue")
-                    is_enabled = continue_btn.is_enabled(timeout=1000)
-                    logger.info("[DEBUG] Continue button enabled: %s", is_enabled)
-                except Exception as e:
-                    logger.warning("[DEBUG] Could not check Continue button: %s", str(e))
-
-                # Try to get input from user (works in interactive terminals)
-                # If no stdin available, just wait for auto-detection
-                try:
-                    email_or_phone = input(f"\n[Attempt {attempt}/{MAX_LOGIN_ATTEMPTS}] Enter your Amazon email or phone number\n(Leave blank to use auto-fill test mode): ").strip()
-
-                    if email_or_phone:
-                        logger.info("You entered: %s", "***MASKED***" if "@" in email_or_phone else email_or_phone)
-                        logger.info("Auto-filling email field and clicking Continue button...")
-
-                        # Find and fill the email field
-                        try:
-                            for email_id in ["ap_email_login", "ap_email"]:
-                                try:
-                                    email_field = page.locator(f"#{email_id}")
-                                    if email_field.is_visible(timeout=2000):
-                                        email_field.fill(email_or_phone)
-                                        logger.info("✓ Filled email field with ID: #%s", email_id)
-                                        break
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logger.warning("✗ Could not fill email field: %s", str(e))
-
-                        # Wait a moment for the field to register
-                        page.wait_for_timeout(1500)
-
-                        # Click the Continue button
-                        try:
-                            continue_btn = page.locator("#continue")
-                            if continue_btn.is_visible(timeout=2000):
-                                continue_btn.click()
-                                logger.info("✓ Clicked Continue button")
-                                page.wait_for_timeout(2000)
-                            else:
-                                logger.warning("⚠ Continue button not visible, user will need to click manually")
-                        except Exception as e:
-                            logger.warning("⚠ Could not click Continue button automatically: %s", str(e))
-
-                        # Wait for page to load (handle stuck/loading state)
-                        logger.info("\n⏳ Waiting for next page to load...")
-                        page_loaded = False
-                        for wait_attempt in range(30):  # Try for up to 30 seconds
-                            try:
-                                # Check if we're on password, OTP, or any signin variant
-                                if page.locator("#ap_password").is_visible(timeout=1000):
-                                    logger.info("✓ Password field appeared!")
-                                    page_loaded = True
-                                    break
-                            except Exception:
-                                pass
-
-                            try:
-                                # Check for OTP field (multiple selectors for different Amazon variants)
-                                otp_selectors = [
-                                    'input[type="tel"]',
-                                    'input[placeholder*="OTP"]',
-                                    'input[placeholder*="code"]',
-                                    'input[placeholder*="digit"]',
-                                    'input[id*="otp"]',
-                                    'input[id*="verification"]'
-                                ]
-                                for selector in otp_selectors:
-                                    try:
-                                        if page.locator(selector).is_visible(timeout=500):
-                                            logger.info("✓ OTP field appeared!")
-                                            page_loaded = True
-                                            break
-                                    except Exception:
-                                        pass
-                                if page_loaded:
-                                    break
-                            except Exception:
-                                pass
-
-                            # Check if page is still loading or stuck
-                            if wait_attempt % 5 == 0:
-                                logger.info("  [%d/30] Still waiting for page to load...", wait_attempt)
-
-                            page.wait_for_timeout(1000)
-
-                        if not page_loaded:
-                            logger.warning("⚠ Page didn't load after 30 seconds - may be stuck")
-                            logger.info("Attempting to refresh page...")
-                            page.reload(wait_until="domcontentloaded")
-                            page.wait_for_timeout(3000)
-                            logger.info("Page refreshed")
-
-                        # Now prompt for next action
-                        logger.info("\n" + "="*72)
-                        logger.info("2FA VERIFICATION REQUIRED")
-                        logger.info("="*72)
-
-                        try:
-                            if page.locator("#ap_password").is_visible(timeout=2000):
-                                logger.info("\n🔐 Password field is ready.")
-                                logger.info("Please enter your Amazon password in the browser.")
-                                logger.info("After entering password, 2FA may be triggered.")
-                                input("\nPress Enter when you've entered password and completed any 2FA...")
-                            else:
-                                # Check for OTP
-                                logger.info("\n📱 OTP Verification Required!")
-                                logger.info("You should have received an OTP code on your phone.")
-                                otp_code = input("\nEnter the 6-digit OTP code: ").strip()
-
-                                if otp_code:
-                                    logger.info("Entering OTP code...")
-                                    otp_selectors = [
-                                        'input[type="tel"]',
-                                        'input[placeholder*="OTP"]',
-                                        'input[placeholder*="code"]',
-                                        'input[placeholder*="digit"]',
-                                        'input[id*="otp"]',
-                                        'input[id*="verification"]'
-                                    ]
-
-                                    otp_entered = False
-                                    for selector in otp_selectors:
-                                        try:
-                                            field = page.locator(selector)
-                                            if field.is_visible(timeout=1000):
-                                                field.fill(otp_code)
-                                                logger.info("✓ OTP code entered")
-                                                page.wait_for_timeout(1000)
-
-                                                # Look for submit button
-                                                try:
-                                                    submit_btn = page.locator('button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue")')
-                                                    if submit_btn.is_visible(timeout=2000):
-                                                        submit_btn.click()
-                                                        logger.info("✓ Clicked verification button")
-                                                        page.wait_for_timeout(3000)
-                                                except Exception:
-                                                    logger.info("⚠ Could not find submit button, user may need to click manually")
-
-                                                otp_entered = True
-                                                break
-                                        except Exception:
-                                            pass
-
-                                    if not otp_entered:
-                                        logger.warning("⚠ Could not find OTP field to fill")
-
-                                    logger.info("\nWaiting for redirect to homepage...")
-                                    input("Press Enter when you're on the Amazon homepage...")
-                                else:
-                                    logger.info("No OTP provided, waiting manually...")
-                                    input("Press Enter when you've completed 2FA and are on the homepage...")
-                        except Exception as e:
-                            logger.warning("Exception during 2FA handling: %s", str(e))
-                            logger.info("Please complete 2FA manually in the browser.")
-                            input("Press Enter when you're on the Amazon homepage...")
-                    else:
-                        logger.info("Blank input - waiting for manual login...")
-                        input(f"\n[Attempt {attempt}/{MAX_LOGIN_ATTEMPTS}] Instructions:\n"
-                              "1. FILL EMAIL/PHONE field with your Amazon email or phone\n"
-                              "2. Click CONTINUE button\n"
-                              "3. FILL PASSWORD field\n"
-                              "4. Complete 2FA/OTP if prompted\n"
-                              "5. When on homepage, press Enter here...\n")
+                    logger.info("\nPress Enter when logged in on the Amazon homepage: ")
+                    input("")
                 except EOFError:
-                    # Non-interactive mode: wait longer and auto-detect login
-                    logger.info("\n[Attempt %d/%d] Running in non-interactive mode - auto-detecting login...", attempt, MAX_LOGIN_ATTEMPTS)
-                    logger.info("\nSTEPS:")
-                    logger.info("1. FILL the email/phone field")
-                    logger.info("2. Click the CONTINUE button")
-                    logger.info("3. FILL the password field")
-                    logger.info("4. Complete 2FA/OTP if prompted")
-                    logger.info("5. Wait for redirect to Amazon homepage")
-                    logger.info("\nWaiting up to 180 seconds for manual login completion...")
-
-                    # Wait and check every 5 seconds if page has returned to homepage
-                    for wait_count in range(36):  # 180 seconds / 5 seconds = 36 checks
+                    logger.info("Non-interactive mode - waiting 300 seconds for login...")
+                    for i in range(60):
                         page.wait_for_timeout(5000)
-                        current_url = page.url
-
-                        if "signin" not in current_url.lower():
-                            logger.info("✓ Detected navigation away from signin page!")
-                            logger.info("Current URL: %s", current_url)
+                        if "signin" not in page.url.lower():
+                            logger.info("✓ Navigation away from signin detected")
                             break
 
-                        remaining = 180 - (wait_count * 5)
-                        if remaining % 30 == 0:
-                            logger.info("Still waiting... %d seconds remaining", remaining)
-
-                    logger.info("Auto-detection phase complete")
-
+                # Wait for page to settle after login
+                logger.info("Waiting for page to settle after login...")
                 try:
-                    # Navigate to Amazon homepage to verify login and let it settle.
-                    logger.info("\nNavigating to Amazon homepage: %s", HOMEPAGE_URL)
-                    page.goto(HOMEPAGE_URL, timeout=60000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(6000)
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    logger.info("✓ Page settled (network idle)")
+                except Exception:
+                    logger.warning("⚠ Page didn't reach network idle (continuing)")
+                    page.wait_for_timeout(3000)
 
-                    # Log the current page state for debugging
-                    current_url = page.url
-                    page_text = "(unable to read)"
-                    try:
-                        page_text = page.inner_text("body")[:500]
-                    except Exception as e:
-                        logger.warning("Could not read page text: %s", type(e).__name__)
+                _take_screenshot(page, "bootstrap_03_after_login.png")
 
+            # VERIFICATION: Verify authentication
+            try:
+                if _verify_logged_in(context, page):
                     logger.info("\n" + "=" * 72)
-                    logger.info("VERIFICATION CHECK")
+                    logger.info("SAVING SESSION")
                     logger.info("=" * 72)
-                    logger.info("Current URL: %s", current_url)
-                    logger.info("Page content (first 500 chars):")
-                    logger.info(page_text)
-                    logger.info("=" * 72)
+                    logger.info(f"Saving to: {SESSION_FILE}")
 
-                    logger.info("\nVerifying session looks logged in...")
-                    if _verify_logged_in(page):
-                        logger.info("✓ Session looks logged in!")
-                    else:
-                        logger.warning(
-                            "✗ Could not detect logged-in session.\n"
-                            "  Possible reasons:\n"
-                            "  - Sign-in page is still showing\n"
-                            "  - 2FA prompt is still active\n"
-                            "  - Page is stuck on an intermediate prompt\n"
-                            "  - Browser back-button may be needed\n\n"
-                            "Attempt %d of %d will try again...",
-                            attempt, MAX_LOGIN_ATTEMPTS
-                        )
-                        continue
-
-                    # Give one more moment for any final redirects to settle.
-                    page.wait_for_timeout(2000)
-
-                    # Save the session.
-                    logger.info("Saving session to %s", SESSION_FILE)
                     context.storage_state(path=SESSION_FILE)
-                    logger.info("Session saved successfully.")
-                    logger.info(
-                        "The checkout automation will now load this session "
-                        "whenever Amazon surfaces a sign-in wall."
-                    )
+                    logger.info("✓ Session saved successfully")
+                    logger.info("Checkout automation can now use this session.")
+
+                    _take_screenshot(page, "bootstrap_04_success_homepage.png")
                     return Path(SESSION_FILE)
+                else:
+                    logger.error("✗ Authentication verification failed")
+                    logger.error("The browser session does not show a valid authenticated state.")
+                    logger.error("Please verify you completed login and try again.")
+                    sys.exit(1)
 
-                except Exception as e:
-                    # Don't close page here - we're using it for next retry attempt
-                    logger.error("\n✗ ERROR during verification (attempt %d):", attempt)
-                    logger.error("Exception type: %s", type(e).__name__)
-                    logger.error("Exception message: %s", str(e))
-                    logger.error("\nFull traceback:")
-                    traceback.print_exc()
-                    logger.warning("Will retry with same page...")
-                    continue
-
-            # If we get here, all attempts failed.
-            logger.error(
-                "\n" + "=" * 72
-            )
-            logger.error(
-                "Could not bootstrap a logged-in Amazon session after %d attempt(s).",
-                MAX_LOGIN_ATTEMPTS,
-            )
-            logger.error(
-                "Do not run the checkout automation yet -- it will fail with an "
-                "'Amazon session expired or missing' error until you successfully "
-                "run this script."
-            )
-            logger.error("=" * 72)
-            sys.exit(1)
+            except Exception as e:
+                logger.error(f"\n✗ ERROR during verification: {e}")
+                logger.error("Full traceback:")
+                traceback.print_exc()
+                sys.exit(1)
 
     except Exception as e:
-        logger.error("\n✗ FATAL ERROR (outer scope):")
-        logger.error("Exception type: %s", type(e).__name__)
-        logger.error("Exception message: %s", str(e))
-        logger.error("\nFull traceback:")
+        logger.error(f"\n✗ FATAL ERROR: {type(e).__name__}: {e}")
+        logger.error("Full traceback:")
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if context:
+            try:
+                context.close()
+                logger.info("Browser closed")
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -772,16 +428,14 @@ def main() -> None:
     print("=" * 72)
     print()
     print(
-        "This script opens a REAL browser window and waits for YOU to log in "
-        "to Amazon manually."
+        "This script opens a REAL browser window with a persistent Chrome profile "
+        "and waits for YOU to log in to Amazon manually."
     )
     print("No password is stored anywhere. Only the resulting browser session")
     print("(cookies + local storage) is saved to disk.")
     print()
     print(f"Session will be saved to: {SESSION_FILE}")
-    print()
-    print("If you already have a valid session file there and just want to")
-    print("renew it, this script overwrites it with a fresh one.")
+    print(f"Chrome profile: {AMAZON_PROFILE_DIR}")
     print()
     print("=" * 72)
     print()
